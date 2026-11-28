@@ -1,22 +1,20 @@
 --[[
-	Celestial Hub | FNF Remix Bot V2
-	Cambios sobre V1 (a partir del log real):
-	- Campo: ya no elige la fila con mas objetos (eran notas aparcadas arriba, y=6). Elige la fila a la que
-	  las notas LLEGAN de verdad (puntaje por llegadas) y no cambia por ruido.
-	- Tiempo: velocidad por ventana de muestras (antes muy ruidosa), adelanto total = ajuste manual
-	  + latencia real medida de las teclas + medio frame.
-	- Rendimiento: los objetos estaticos y los descartados se revisan con poca frecuencia (antes ~950 por frame).
-	- Resultado por nota (inferido: la nota desaparece cerca del receptor = acierto) y distancia al recibir la tecla.
-	- Interfaz: el numero del adelanto quedaba tapado por el boton "-".
+	Celestial Hub | FNF Remix Bot V3
+	Cambios sobre V2 (que ya funcionaba bien):
+	- NOTAS LARGAS: mantiene la tecla apretada mientras la nota larga pasa por el receptor y la suelta
+	  cuando la cola llega (barras alargadas o cadenas de segmentos pegados). Antes solo daba un toque corto.
+	- Adelanto en ms con cualquier decimal (se puede escribir, ej. 47.5, o usar -/+ de 0.5). Por defecto 46.5, maximo 60.
+	- "Soltar +ms": cuanto despues del momento exacto se suelta una nota larga (por defecto 25 ms).
+	- Escaneo mas liviano (los descartados se revisan con retardo escalonado).
 	Teclas: Left = Z | Down = X | Up = Comma (,) | Right = Period (.)
-	VERSION EXPERIMENTAL: no probada en el juego.
+	VERSION EXPERIMENTAL: la deteccion de notas largas no esta probada en el juego; el log dice que ve.
 ]]
 
 if _G.CelestialFNF and type(_G.CelestialFNF.Destroy) == "function" then
 	pcall(_G.CelestialFNF.Destroy)
 end
 
-local FNF = {Enabled = false, SpoofPC = false, LeadMs = 30, EnabledAt = 0, Page = "menu", Open = false, Running = true, LogDirty = true}
+local FNF = {Enabled = false, SpoofPC = false, LeadMs = 46.5, ReleaseMs = 25, EnabledAt = 0, Page = "menu", Open = false, Running = true, LogDirty = true}
 _G.CelestialFNF = FNF
 
 local Players = game:GetService("Players")
@@ -68,7 +66,7 @@ local function logEvery(key, secs, kind, msg)
 	end
 end
 
-addLog("INFO", string.format("V2 | VIM=%s keypress=%s Teclado=%s Touch=%s", tostring(VIM ~= nil),
+addLog("INFO", string.format("V3 | VIM=%s keypress=%s Teclado=%s Touch=%s", tostring(VIM ~= nil),
 	tostring(typeof(keypress) == "function"), tostring(UIS.KeyboardEnabled), tostring(UIS.TouchEnabled)))
 
 -- ============================ TECLAS ============================
@@ -88,6 +86,7 @@ local function rawKey(down, kc, vk)
 	return false, "ninguno"
 end
 
+-- Pulsacion corta (nota normal)
 function Keys.Tap(lane, holdTime)
 	local kc = lane.Key
 	lane.Token = (lane.Token or 0) + 1
@@ -112,12 +111,39 @@ function Keys.Tap(lane, holdTime)
 	return true
 end
 
-local function releaseAll()
-	for _, lane in ipairs(LANES) do
-		lane.Token = (lane.Token or 0) + 1
-		rawKey(false, lane.Key, lane.VK)
-		lane.Held = false
+-- Mantener apretada (nota larga). Se suelta con Keys.Release o por seguridad tras maxSecs.
+function Keys.Hold(lane, maxSecs)
+	local kc = lane.Key
+	lane.Token = (lane.Token or 0) + 1
+	local tok = lane.Token
+	if lane.Held then rawKey(false, kc, lane.VK) end
+	local ok, backend = rawKey(true, kc, lane.VK)
+	if not ok then
+		Keys.Failures += 1
+		addLog("KEYERR", "No se pudo mantener " .. lane.Label .. " (" .. lane.Name .. "): ningun backend de teclado disponible")
+		return false
 	end
+	Keys.Backend = backend
+	Keys.Sent += 1
+	lane.Held = true
+	pendingDown[kc] = os.clock()
+	task.delay(maxSecs or 10, function()
+		if lane.Token == tok then
+			rawKey(false, kc, lane.VK)
+			lane.Held = false
+		end
+	end)
+	return true
+end
+
+function Keys.Release(lane)
+	lane.Token = (lane.Token or 0) + 1
+	rawKey(false, lane.Key, lane.VK)
+	lane.Held = false
+end
+
+local function releaseAll()
+	for _, lane in ipairs(LANES) do Keys.Release(lane) end
 end
 
 track(UIS.InputBegan:Connect(function(input)
@@ -177,6 +203,12 @@ local function text(parent, str, size, color, font, xa)
 end
 local function tween(o, t, props) TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props):Play() end
 
+local function fmtNum(v)
+	local s = string.format("%.2f", v)
+	s = s:gsub("0+$", ""):gsub("%.$", "")
+	return s
+end
+
 local parentGui
 if typeof(gethui) == "function" then pcall(function() parentGui = gethui() end) end
 if not parentGui then pcall(function() parentGui = game:GetService("CoreGui") end) end
@@ -186,69 +218,83 @@ if not (parentGui and pcall(function() gui.Parent = parentGui end)) then gui.Par
 
 -- ============================ DETECTOR ============================
 local MIN_SZ, MAX_SZ = 24, 260
-local cands, tracks, rejectUntil = {}, {}, {}
+local cands, frameCand, tracks, rejectUntil = {}, {}, {}, {}
 local Rows, Field = {}, nil
-local Stats = {Pressed = 0, Hits = 0, Misses = 0, Moving = 0, Statics = 0}
+local Stats = {Pressed = 0, Hits = 0, Misses = 0, Moving = 0, Statics = 0, Holds = 0, Bars = 0, Chains = 0, BarsSeen = 0, ChainsSeen = 0}
 local Perf = {dt = 1 / 60}
 local Pend = {}
+local Hold = {}
 local lastMovingAt, lastFieldCalc, lastStepAt = 0, 0, 0
 local lastLanePress = {0, 0, 0, 0}
 
 local function addCand(o)
-	if (o:IsA("ImageLabel") or o:IsA("ImageButton")) and not o:IsDescendantOf(gui) then
-		cands[o] = o:FindFirstAncestorWhichIsA("ScreenGui") or false
+	if o:IsA("ImageLabel") or o:IsA("ImageButton") then
+		if not o:IsDescendantOf(gui) then cands[o] = o:FindFirstAncestorWhichIsA("ScreenGui") or false end
+	elseif o:IsA("Frame") then
+		-- Los Frame solo cuentan como posibles barras de notas largas (nunca como notas/receptores).
+		if not o:IsDescendantOf(gui) then
+			cands[o] = o:FindFirstAncestorWhichIsA("ScreenGui") or false
+			frameCand[o] = true
+		end
 	end
 end
 pcall(function() for _, d in ipairs(pg:GetDescendants()) do addCand(d) end end)
 track(pg.DescendantAdded:Connect(addCand))
-track(pg.DescendantRemoving:Connect(function(o) cands[o] = nil tracks[o] = nil rejectUntil[o] = nil end))
+track(pg.DescendantRemoving:Connect(function(o) cands[o] = nil frameCand[o] = nil tracks[o] = nil rejectUntil[o] = nil end))
 
-local function resetTrack(t, cx, cy, now)
+local function resetTrack(t, cx, cy, now, top, bot)
 	t.prevY = t.y
 	t.n, t.vx, t.vy = 1, 0, 0
-	t.hist = {{now, cx, cy}}
+	t.hist = {{now, cx, cy, top, bot}}
 	t.pressed, t.scored, t.static = false, false, false
 	t.x0, t.y0 = cx, cy
 	t.x, t.y, t.t = cx, cy, now
 	t.resets += 1
 end
 
--- Revisa un objeto candidato; agrega a `moving` si se mueve como una nota.
-local function process(o, g, t, now, moving)
+local function rejectFor(o, now)
+	rejectUntil[o] = now + 0.4 + math.random() * 0.3
+	tracks[o] = nil
+end
+
+-- Revisa un candidato: notas (cuadradas) van a `moving`, barras alargadas a `bars`.
+local function process(o, g, t, now, moving, bars)
 	if not (g and g.Enabled and o.Visible) then
-		rejectUntil[o] = now + 0.5
-		tracks[o] = nil
+		rejectFor(o, now)
 		return
 	end
 	local s = o.AbsoluteSize
 	local sx, sy = s.X, s.Y
-	if not (sx >= MIN_SZ and sx <= MAX_SZ and sy >= MIN_SZ and sy <= MAX_SZ and sx / sy > 0.6 and sx / sy < 1.6) then
-		rejectUntil[o] = now + 0.5
-		tracks[o] = nil
+	local isSquare = (not frameCand[o]) and sx >= MIN_SZ and sx <= MAX_SZ and sy >= MIN_SZ and sy <= MAX_SZ and sx / sy > 0.6 and sx / sy < 1.6
+	local isBar = (not isSquare) and sx >= 8 and sx <= 220 and sy >= sx * 1.8 and sy <= 3000
+	if not (isSquare or isBar) then
+		rejectFor(o, now)
 		return
 	end
 	local p = o.AbsolutePosition
+	local top, bot = p.Y, p.Y + sy
 	local cx, cy = p.X + sx * 0.5, p.Y + sy * 0.5
 	if not t then
 		tracks[o] = {o = o, x = cx, y = cy, x0 = cx, y0 = cy, prevY = cy, t = now, n = 1, size = sx, vx = 0, vy = 0,
-			hist = {{now, cx, cy}}, resets = 0, pressed = false, scored = false, static = false}
+			hist = {{now, cx, cy, top, bot}}, resets = 0, pressed = false, scored = false, static = false,
+			top = top, bot = bot, w = sx, h = sy, bar = isBar}
 		return
 	end
-	t.size = sx
+	t.size, t.top, t.bot, t.w, t.h, t.bar = sx, top, bot, sx, sy, isBar
 	if t.static then
 		if math.abs(cy - t.y) + math.abs(cx - t.x) > 1.5 then
-			resetTrack(t, cx, cy, now)
+			resetTrack(t, cx, cy, now, top, bot)
 		else
 			t.x, t.y, t.t = cx, cy, now
 		end
 		return
 	end
 	if now - t.t > 0.25 or math.abs(cy - t.y) > sy * 3 or math.abs(cx - t.x) > sx * 3 then
-		resetTrack(t, cx, cy, now)
+		resetTrack(t, cx, cy, now, top, bot)
 		return
 	end
 	local h = t.hist
-	h[#h + 1] = {now, cx, cy}
+	h[#h + 1] = {now, cx, cy, top, bot}
 	if #h > 7 then table.remove(h, 1) end
 	t.x, t.y, t.t = cx, cy, now
 	t.n += 1
@@ -257,12 +303,30 @@ local function process(o, g, t, now, moving)
 		local span = b[1] - a[1]
 		if span >= 0.05 then
 			t.vx = (b[2] - a[2]) / span
-			t.vy = (b[3] - a[3]) / span
+			if isBar then
+				-- Una barra puede achicarse al ser golpeada: se usa el borde que mas se mueve.
+				local vt, vb = (b[4] - a[4]) / span, (b[5] - a[5]) / span
+				t.vy = math.abs(vt) >= math.abs(vb) and vt or vb
+			else
+				t.vy = (b[3] - a[3]) / span
+			end
 		end
 	end
 	local avy, avx = math.abs(t.vy), math.abs(t.vx)
 	if #h >= 4 and avy >= 150 and avy <= 8000 and avx <= avy * 0.3 then
-		moving[#moving + 1] = t
+		if isBar then
+			bars[#bars + 1] = t
+			if not t.logged then
+				t.logged = true
+				Stats.BarsSeen += 1
+				if Stats.BarsSeen <= 4 then
+					addLog("BAR", string.format("Barra larga detectada: %s [%s] ancho=%d alto=%d padre=%s", o.Name, o.ClassName,
+						math.floor(sx), math.floor(sy), o.Parent and o.Parent.Name or "?"))
+				end
+			end
+		else
+			moving[#moving + 1] = t
+		end
 	elseif t.n >= 12 and avx < 8 and avy < 8 then
 		t.static = true
 		t.hist = {}
@@ -273,7 +337,7 @@ end
 local function rebuildRows(now)
 	local statics = {}
 	for _, t in pairs(tracks) do
-		if t.static then statics[#statics + 1] = t end
+		if t.static and not t.bar then statics[#statics + 1] = t end
 	end
 	Stats.Statics = #statics
 	table.sort(statics, function(a, b) return a.y < b.y end)
@@ -332,6 +396,64 @@ local function rebuildRows(now)
 	end
 end
 
+-- Carril (1..4) de una coordenada x, o nil si no esta alineada con ninguna de las 4 columnas del jugador.
+local function laneFor(cols, nc, x, tol)
+	local bi, bd
+	for i = nc - 3, nc do
+		local d = math.abs(x - cols[i].x)
+		if not bd or d < bd then bi, bd = i - (nc - 4), d end
+	end
+	if bi and bd <= cols[bi + nc - 4].size * tol then return bi end
+	return nil
+end
+
+local function byDn(a, b) return a.dn < b.dn end
+
+-- Nota normal que es la cabeza de una nota larga (barra o cadena), o nil.
+local function holdForHead(n, hb)
+	for _, o in ipairs(hb) do
+		if o.lane == n.lane then
+			if o.kind == "chain" then
+				if o.first == n then return o end
+			elseif math.abs(n.dn - o.dLead) <= n.size * 1.4 and n.dn <= o.dTail then
+				return o
+			end
+		end
+	end
+	return nil
+end
+
+-- Tapa del final de una barra (no se pulsa).
+local function isEndCap(n, hb)
+	for _, o in ipairs(hb) do
+		if o.kind == "bar" and o.lane == n.lane and n.dn >= o.dTail - n.size * 0.3 and n.dn <= o.dTail + n.size * 1.2 then
+			return true
+		end
+	end
+	return false
+end
+
+local function headNear(o, moving)
+	for _, n in ipairs(moving) do
+		if n.lane == o.lane and math.abs(n.dn - o.dLead) <= n.size * 1.4 then return true end
+	end
+	return false
+end
+
+local function startHold(bi, o, now, sendLead)
+	local lane = LANES[bi]
+	local est = math.clamp(o.dTail / math.max(o.v, 1), 0.05, 15)
+	if Keys.Hold(lane, est + 2) then
+		Stats.Holds += 1
+		Hold[bi] = {since = now, est = est, endAt = now + est - sendLead, idx = Stats.Holds}
+		if Stats.Holds <= 12 or Stats.Holds % 10 == 0 then
+			addLog("HOLD", string.format("#%d %s inicio (%s) largo=%dpx est=%.2fs", Stats.Holds, lane.Name, o.kind, math.floor(o.dTail - o.dLead), est))
+		end
+		return true
+	end
+	return false
+end
+
 local function step()
 	local now = os.clock()
 	local dtf = math.min(now - lastStepAt, 0.2)
@@ -354,22 +476,22 @@ local function step()
 
 	if not FNF.Enabled then return end
 
-	local moving = {}
+	local moving, bars = {}, {}
 	for o, g in pairs(cands) do
-		if o.Parent == nil then
-			cands[o] = nil
-			tracks[o] = nil
-			rejectUntil[o] = nil
-		else
-			local rej = rejectUntil[o]
+		local rej = rejectUntil[o]
+		if not (rej and now < rej) then
 			local t = tracks[o]
-			if not ((rej and now < rej) or (t and t.static and now - t.t < 0.2)) then
-				process(o, g, t, now, moving)
+			if not (t and t.static and now - t.t < 0.2) then
+				if o.Parent == nil then
+					cands[o], frameCand[o], tracks[o], rejectUntil[o] = nil, nil, nil, nil
+				else
+					process(o, g, t, now, moving, bars)
+				end
 			end
 		end
 	end
 
-	Stats.Moving = #moving
+	Stats.Moving, Stats.Bars = #moving, #bars
 	if #moving > 0 then lastMovingAt = now end
 
 	if now - lastFieldCalc >= 0.25 then
@@ -433,31 +555,125 @@ local function step()
 	if not Field or not Field.cols then return end
 	local cols, nc = Field.cols, #Field.cols
 	if nc < 4 then return end
+	local fy = Field.y
+	local refSize = cols[nc].size
 	local leadTotal = FNF.LeadMs / 1000 + Keys.Latency + Perf.dt * 0.5
+	local sendLead = leadTotal - FNF.ReleaseMs / 1000
+
+	-- Objetos "largos" de este frame: barras alargadas y cadenas de segmentos pegados (3 o mas).
+	local hb = {}
+	for _, b in ipairs(bars) do
+		local bi = laneFor(cols, nc, b.x, 0.6)
+		if bi then
+			local dirv = b.vy > 0 and 1 or -1
+			local lead = dirv > 0 and b.bot or b.top
+			local trail = dirv > 0 and b.top or b.bot
+			hb[#hb + 1] = {kind = "bar", lane = bi, v = math.abs(b.vy), dirv = dirv, dLead = (fy - lead) * dirv, dTail = (fy - trail) * dirv, ref = b}
+		end
+	end
+	local byLane = {{}, {}, {}, {}}
 	for _, n in ipairs(moving) do
-		if not n.pressed then
-			local bi, bc, bd
-			for i = nc - 3, nc do
-				local d = math.abs(n.x - cols[i].x)
-				if not bd or d < bd then bi, bc, bd = i - (nc - 4), cols[i], d end
+		n.lane, n.inChain, n.chainObj = nil, false, nil
+		local bi = laneFor(cols, nc, n.x, 0.45)
+		if bi then
+			n.lane = bi
+			n.dirv = n.vy > 0 and 1 or -1
+			n.dn = (fy - n.y) * n.dirv
+			local L = byLane[bi]
+			L[#L + 1] = n
+		end
+	end
+	local chains = 0
+	for bi = 1, 4 do
+		local L = byLane[bi]
+		if #L >= 3 then
+			table.sort(L, byDn)
+			local i = 1
+			while i <= #L do
+				local j = i
+				while j < #L and (L[j + 1].dn - L[j].dn) <= L[j].size * 1.12 do j += 1 end
+				if j - i >= 2 then
+					local first, last = L[i], L[j]
+					local o = {kind = "chain", lane = bi, first = first, v = math.abs(first.vy), dirv = first.dirv,
+						dLead = first.dn - first.size * 0.5, dTail = last.dn + last.size * 0.5}
+					hb[#hb + 1] = o
+					chains += 1
+					for k = i, j do L[k].inChain, L[k].chainObj = true, o end
+					if not first.chainLogged then
+						first.chainLogged = true
+						Stats.ChainsSeen += 1
+						if Stats.ChainsSeen <= 4 then
+							addLog("CHAIN", string.format("Cadena de %d segmentos pegados en %s (posible nota larga)", j - i + 1, LANES[bi].Name))
+						end
+					end
+				end
+				i = j + 1
 			end
-			if bc and bd <= bc.size * 0.45 then
-				local dirv = n.vy > 0 and 1 or -1
-				local dist = (Field.y - n.y) * dirv
-				local v = math.abs(n.vy)
-				if dist <= v * leadTotal then
-					n.pressed = true
-					if dist >= -n.size * 0.9 and now - lastLanePress[bi] >= 0.03 then
-						lastLanePress[bi] = now
-						if Keys.Tap(LANES[bi], 0.05) then
-							Stats.Pressed += 1
-							if #Pend < 40 then
-								Pend[#Pend + 1] = {t = n, lane = bi, at = now, dist = dist, v = v, dirv = dirv, ry = Field.y, size = n.size, resets = n.resets}
-							end
-							if Stats.Pressed <= 15 or Stats.Pressed % 25 == 0 then
-								addLog("NOTE", string.format("#%d %s (%s) vel=%d dist=%d adelanto=%dms", Stats.Pressed, LANES[bi].Name, LANES[bi].Label,
-									math.floor(v), math.floor(dist), math.floor(leadTotal * 1000)))
-							end
+		end
+	end
+	Stats.Chains = chains
+
+	-- 1) Mantener o soltar las notas largas en curso
+	for bi = 1, 4 do
+		local h = Hold[bi]
+		if h then
+			local lane = LANES[bi]
+			if not lane.Held then
+				Hold[bi] = nil
+			else
+				local keep = false
+				for _, o in ipairs(hb) do
+					if o.lane == bi and o.dLead <= o.v * leadTotal + refSize * 0.6 and o.dTail > o.v * sendLead then
+						keep = true
+						break
+					end
+				end
+				if not keep and now < h.endAt and now - h.since < h.est * 0.85 then
+					keep = true -- la barra desaparecio antes de tiempo: se sigue la estimacion del inicio
+				end
+				if not keep then
+					Keys.Release(lane)
+					Hold[bi] = nil
+					if h.idx <= 12 or h.idx % 10 == 0 then
+						addLog("HOLD", string.format("#%d %s fin tras %.2fs (est %.2fs)", h.idx, lane.Name, now - h.since, h.est))
+					end
+				end
+			end
+		end
+	end
+
+	-- 2) Notas largas sin cabeza separada: la propia barra dispara el inicio
+	for _, o in ipairs(hb) do
+		if o.kind == "bar" and not Hold[o.lane] and o.dLead <= o.v * leadTotal and o.dLead >= -refSize * 0.9 and o.dTail > o.v * sendLead then
+			if not headNear(o, moving) then startHold(o.lane, o, now, sendLead) end
+		end
+	end
+
+	-- 3) Notas normales y cabezas de notas largas
+	for _, n in ipairs(moving) do
+		if not n.pressed and n.lane then
+			local bi = n.lane
+			local v = math.abs(n.vy)
+			if n.dn <= v * leadTotal then
+				n.pressed = true
+				local skip = Hold[bi] ~= nil or (n.inChain and n.chainObj.first ~= n)
+				local ho = nil
+				if not skip then
+					ho = holdForHead(n, hb)
+					if not ho and isEndCap(n, hb) then skip = true end
+				end
+				if not skip and n.dn >= -n.size * 0.9 and now - lastLanePress[bi] >= 0.03 then
+					lastLanePress[bi] = now
+					local ok
+					if ho then ok = startHold(bi, ho, now, sendLead) else ok = Keys.Tap(LANES[bi], 0.05) end
+					if ok then
+						Stats.Pressed += 1
+						if #Pend < 40 then
+							Pend[#Pend + 1] = {t = n, lane = bi, at = now, dist = n.dn, v = v, dirv = n.dirv, ry = fy, size = n.size, resets = n.resets}
+						end
+						if Stats.Pressed <= 15 or Stats.Pressed % 25 == 0 then
+							addLog("NOTE", string.format("#%d %s (%s)%s vel=%d dist=%d adelanto=%dms", Stats.Pressed, LANES[bi].Name, LANES[bi].Label,
+								ho and " LARGA" or "", math.floor(v), math.floor(n.dn), math.floor(leadTotal * 1000)))
 						end
 					end
 				end
@@ -471,17 +687,18 @@ function FNF.SetEnabled(v)
 	FNF.Enabled = v
 	if v then
 		FNF.EnabledAt = os.clock()
-		addLog("BOT", string.format("Bot ACTIVADO (ajuste manual %d ms)", FNF.LeadMs))
+		addLog("BOT", string.format("Bot ACTIVADO (adelanto %s ms, soltar +%s ms)", fmtNum(FNF.LeadMs), fmtNum(FNF.ReleaseMs)))
 	else
 		releaseAll()
 		Pend = {}
+		Hold = {}
 		addLog("BOT", "Bot desactivado")
 	end
 end
 
 -- ============================ UI ============================
 local win = mk("Frame", {Name = "Window", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(300, 270), BackgroundColor3 = C.Dark, Visible = false}, gui)
+	Size = UDim2.fromOffset(300, 290), BackgroundColor3 = C.Dark, Visible = false}, gui)
 corner(win, 18)
 stroke(win, C.Lilac, 1.5, 0.2)
 mk("UIGradient", {Color = ColorSequence.new(C.Dark, C.Purple), Rotation = 90}, win)
@@ -548,6 +765,30 @@ local function toggle(parent, y, str, init, cb)
 	render(false)
 end
 
+-- Fila numerica: [etiqueta] ... [-] [caja editable] [+]. Acepta cualquier decimal (46.5, 47.25, ...).
+local function numberRow(parent, y, label, getv, setv, minv, maxv, step)
+	local row = mk("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(12, y), Size = UDim2.new(1, -24, 0, 30)}, parent)
+	local lbl = text(row, label, 13, C.White)
+	lbl.Size = UDim2.new(0, 104, 1, 0)
+	local box = mk("TextBox", {AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -36, 0, 1), Size = UDim2.fromOffset(62, 28),
+		BackgroundColor3 = C.Button, TextColor3 = C.MoonBlue, Font = Enum.Font.GothamBold, TextSize = 14, ClearTextOnFocus = false,
+		Text = "", PlaceholderText = "ms", TextXAlignment = Enum.TextXAlignment.Center}, row)
+	corner(box, 8)
+	stroke(box, C.Lilac, 1, 0.5)
+	local function apply(v)
+		v = math.clamp(math.floor(v * 100 + 0.5) / 100, minv, maxv)
+		setv(v)
+		box.Text = fmtNum(v)
+	end
+	button(row, "-", UDim2.fromOffset(32, 28), UDim2.new(1, -136, 0, 1), function() apply(getv() - step) end, 18)
+	button(row, "+", UDim2.fromOffset(32, 28), UDim2.new(1, -32, 0, 1), function() apply(getv() + step) end, 18)
+	box.FocusLost:Connect(function()
+		local n = tonumber((box.Text:gsub(",", ".")))
+		if n then apply(n) else box.Text = fmtNum(getv()) end
+	end)
+	apply(getv())
+end
+
 -- Pagina Bot
 toggle(botPage, 10, "FNF Bot", false, function(v) FNF.SetEnabled(v) end)
 toggle(botPage, 46, "Modo PC (avanzado)", false, function(v)
@@ -555,23 +796,11 @@ toggle(botPage, 46, "Modo PC (avanzado)", false, function(v)
 	FNF.SpoofPC = v
 	addLog("PC", v and "Modo PC ACTIVADO" or "Modo PC desactivado")
 end)
-
--- Fila de ajuste: [Adelanto extra] ....... [-] [valor] [+]  (sin solapes: el valor ya no queda tapado)
-local leadRow = mk("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 84), Size = UDim2.new(1, -24, 0, 30)}, botPage)
-local leadLbl = text(leadRow, "Adelanto extra", 14, C.White)
-leadLbl.Size = UDim2.new(0, 110, 1, 0)
-local leadVal = text(leadRow, "", 14, C.MoonBlue, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
-leadVal.AnchorPoint, leadVal.Position, leadVal.Size = Vector2.new(1, 0), UDim2.new(1, -36, 0, 0), UDim2.fromOffset(62, 30)
-local function setLead(v)
-	FNF.LeadMs = math.clamp(v, 0, 250)
-	leadVal.Text = tostring(FNF.LeadMs) .. " ms"
-end
-setLead(FNF.LeadMs)
-button(leadRow, "-", UDim2.fromOffset(32, 28), UDim2.new(1, -136, 0, 1), function() setLead(FNF.LeadMs - 5) end, 18)
-button(leadRow, "+", UDim2.fromOffset(32, 28), UDim2.new(1, -32, 0, 1), function() setLead(FNF.LeadMs + 5) end, 18)
+numberRow(botPage, 84, "Adelanto (ms)", function() return FNF.LeadMs end, function(v) FNF.LeadMs = v end, 0, 60, 0.5)
+numberRow(botPage, 118, "Soltar + (ms)", function() return FNF.ReleaseMs end, function(v) FNF.ReleaseMs = v end, 0, 100, 5)
 
 local statsLabel = text(botPage, "", 12, C.Silver, Enum.Font.Code)
-statsLabel.Position, statsLabel.Size, statsLabel.TextWrapped, statsLabel.TextYAlignment = UDim2.fromOffset(14, 124), UDim2.new(1, -28, 0, 96), true, Enum.TextYAlignment.Top
+statsLabel.Position, statsLabel.Size, statsLabel.TextWrapped, statsLabel.TextYAlignment = UDim2.fromOffset(14, 154), UDim2.new(1, -28, 0, 92), true, Enum.TextYAlignment.Top
 
 -- Pagina Log
 local keyStatus = text(logPage, "", 12, C.Gray, Enum.Font.GothamBold)
@@ -675,8 +904,11 @@ task.spawn(function()
 				menuHint.Text = string.format("Bot: %s\nTeclas: Z=Left X=Down ,=Up .=Right", FNF.Enabled and "ON" or "OFF")
 			elseif FNF.Page == "bot" then
 				local total = FNF.LeadMs + Keys.Latency * 1000 + Perf.dt * 500
-				statsLabel.Text = string.format("Estado: %s | Campo: %s\nPulsadas: %d | Acierto*: %d / Fallo*: %d\nNotas mov: %d | Estaticos: %d\nTeclas: %d env %d conf %d fallas (%s)\nAdelanto total: %d ms (tecla %d + frame %d)",
+				local active = 0
+				for _ in pairs(Hold) do active += 1 end
+				statsLabel.Text = string.format("Estado: %s | Campo: %s\nPulsadas: %d | Acierto*: %d / Fallo*: %d\nLargas: %d (activas %d) | barras %d cadenas %d\nNotas mov: %d | Estaticos: %d\nTeclas: %d env %d conf %d fallas (%s)\nAdelanto total: %d ms (tecla %d + frame %d)",
 					FNF.Enabled and "ON" or "OFF", Field and "OK" or "calibrando", Stats.Pressed, Stats.Hits, Stats.Misses,
+					Stats.Holds, active, Stats.Bars, Stats.Chains,
 					Stats.Moving, Stats.Statics, Keys.Sent, Keys.Confirmed, Keys.Failures, Keys.Backend,
 					math.floor(total), math.floor(Keys.Latency * 1000), math.floor(Perf.dt * 500))
 			elseif FNF.Page == "log" then
@@ -704,4 +936,4 @@ function FNF.Destroy()
 	if _G.CelestialFNF == FNF then _G.CelestialFNF = nil end
 end
 
-addLog("INFO", "FNF Bot V2 cargado. Toca la burbuja para abrir la ventana.")
+addLog("INFO", "FNF Bot V3 cargado. Toca la burbuja para abrir la ventana.")
